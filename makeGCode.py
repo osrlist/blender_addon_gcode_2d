@@ -1,7 +1,7 @@
 bl_info = {
     "name": "G-Code Generator",        # Название в списке аддонов
     "author": "Sergey Badin",             # Твое имя
-    "version": (1, 0),                 # Версия аддона
+    "version": (1, 1),                 # Версия аддона
     "blender": (3, 0, 0),              # Минимальная версия Blender (лучше ставить 3.0+)
     "location": "View3D > Sidebar > Tool Tab", # Где найти аддон
     "description": "Генерация G-кода из кривых в коллекции",
@@ -12,73 +12,141 @@ import bpy
 from bpy import context
 import os
 
+def get_xy_first_point(spline, obj):
+    if not hasattr(spline, 'bezier_points') or not spline.bezier_points:
+        return (float('inf'), float('inf'), [])  # Если это не Bezier или нет точек
+
+    spline_list = []
+    matrix = obj.matrix_world
+    for point in spline.bezier_points:
+        world_coords = matrix @ point.co
+        mmCoords = world_coords * 1000
+        spline_list.append((round(mmCoords.x, 3), round(mmCoords.y, 3)))
+
+    if spline.use_cyclic_u:
+        spline_list.append((spline_list[0][0], spline_list[0][1]))
+
+    return (spline_list[0][0], spline_list[0][1], spline_list)
+
+def addSpleineToList(sorted_splines, i, group):
+    for (s, x_val) in sorted(group, key=lambda item: item[1], reverse=(i % 2 != 0)):
+        if i % 2 == 0:
+            if s[0][0] > s[1][0]:
+                s.reverse() 
+        else:
+            if s[0][0] < s[1][0]:
+                s.reverse() 
+        sorted_splines.append(s)
+
+def sort_bezier_splines_alternating(curve_objects):
+    """
+    Сортирует Bezier сплайны: по Y, затем четные по убыванию X, нечетные по возрастанию X.
+    Учитывает только первые три знака после запятой.
+
+    Args:
+        curve_objects: Список объектов кривых.
+
+    Returns:
+        Отсортированный список Bezier сплайнов.
+    """
+    sorted_splines = []
+    for obj in curve_objects:
+        splines_with_coords = []
+        for spline in obj.data.splines:
+            if hasattr(spline, 'bezier_points'): # только Bezier
+                x, y, list_coordinate = get_xy_first_point(spline, obj)
+                splines_with_coords.append((list_coordinate, x, y))
+
+        # Сортируем по Y сначала
+        splines_with_coords.sort(key=lambda item: item[2])  # Сортируем по Y
+
+        # Теперь сортируем внутри групп с одинаковой Y координатой, чередуя порядок X
+        current_y = splines_with_coords[0][2]
+        group = []
+        i = 0
+        for spline, x, y in splines_with_coords:
+            if y == current_y:
+                group.append((spline, x))
+            else:
+                # Обрабатываем группу с одинаковой Y
+                addSpleineToList(sorted_splines, i, group)
+                i += 1
+
+                # Начинаем новую группу
+                current_y = y
+                group = [(spline, x)]
+
+        # Обрабатываем последнюю группу
+        addSpleineToList(sorted_splines, i, group)
+        
+        
+    return sorted_splines
+
+def print_sorted_bezier_splines_alternating(collection_name, laserPower, speedMove, fileName, laserMode):
+    """
+    Выводит в консоль отсортированные Bezier сплайны.
+    """
+    try:
+        gcode_collection = bpy.data.collections[collection_name]
+    except KeyError:
+        print(f"Коллекция '{collection_name}' не найдена.")
+        return False
+
+    curve_objects = [obj for obj in gcode_collection.objects if obj.type == 'CURVE']
+
+    if not curve_objects:
+        print(f"В коллекции '{collection_name}' нет кривых.")
+        return False
+    
+    sorted_objects = sorted(curve_objects, key=lambda obj: obj.name)
+
+    bezier_curves = []
+    for obj in sorted_objects:
+        for spline in obj.data.splines:
+            if hasattr(spline, 'bezier_points'):
+                bezier_curves.append(obj)  # Добавляем объекты Bezier кривых, а не все
+
+    if not bezier_curves:
+        print(f"В коллекции '{collection_name}' нет Bezier кривых.")
+        return False
+
+    sorted_splines = sort_bezier_splines_alternating(sorted_objects)
+    return makeGcode(sorted_splines, laserPower, speedMove, fileName, laserMode)
 
 # --- ТВОЯ ФУНКЦИЯ (вставь сюда свой код) ---
-def makeGcode(collection_name, laserPower, speedMove, fileName, laserMode):
-    print(f"Экспорт G-Code из коллекции: {collection_name}")
+def makeGcode(sorted_splines, laserPower, speedMove, fileName, laserMode):
     print(f"Параметры: Power={laserPower}, Speed={speedMove}")
     print(f"Файл: {fileName}")
     print(f"LaserMode: {laserMode}")
-    
-#    gcode_collection = bpy.data.collections["gCode"]
-    gcode_collection = bpy.data.collections[collection_name]
-    if gcode_collection:
-        with open(fileName,"w") as file:
-            file.write("G90 (use absolute coordinates)\n")
-            file.write(f"{laserMode} S0\n")
-            file.write(f"F{speedMove}\n") # для сложных объектов 370 для обычных 380  gravirovka 5800 
-            laserPower = f"S{laserPower}"
-            sorted_objects = sorted(gcode_collection.objects, key=lambda obj: obj.name)
-            for obj in sorted_objects:
-                if obj.type == 'CURVE':
-                    print(obj.name)
-                    matrix = obj.matrix_world
-                    for spline in obj.data.splines:
-                        if spline.type == 'BEZIER':
-                            points = spline.bezier_points
-                            x0="x"
-                            y0="y"
-                            i = 0
-                            for point in points:
-                                world_coords = matrix @ point.co
-                                mmCoords = world_coords*1000
-                                x=f"{mmCoords.x:.3f}"
-                                y=f"{mmCoords.y:.3f}"
-                                if x != x0 or y != y0:
-                                    i = i + 1
-                                    if i ==1:
-                                        file.write(f"G0X{x}Y{y}\n")
-                                    else:    
-                                        if i == 2:
-                                            file.write(f"G1X{x}Y{y}{laserPower}\n")
-                                        else:
-                                            file.write(f"X{x}Y{y}\n")    
-                                x0 = x
-                                y0 = y        
-                            if spline.use_cyclic_u:
-                                world_coords = matrix @ points[0].co
-                                mmCoords = world_coords*1000
-                                file.write(f"X{mmCoords.x:.3f}Y{mmCoords.y:.3f}\n")
-                            else:
-                                print("Без цикла")    
-                            file.write("S0\n")
-                        else:
-                            print("Кривая не бизье!")            
-                else:
-                    print("Активный объект не является кривой.")
-            file.write("M5 S0\n")                    
-            file.write("G0 X0 Y0 Z0 (move back to origin)\n")                    
-            file.write("%")
-    else:
-        print("Нет коллекции gCode")
 
-    
-    # Твоя логика здесь...
-    # Например, доступ к объектам:
-    # collection = bpy.data.collections.get(collection_name)
-    # if collection:
-    #     for obj in collection.objects:
-    #         pass 
+    with open(fileName, "w") as file:
+        file.write("G90 (use absolute coordinates)\n")
+        file.write(f"{laserMode} S0\n")
+        file.write(f"F{speedMove}\n")  # для сложных объектов 370 для обычных 380  gravirovka 5800 
+        laserPower = f"S{laserPower}"
+        for spline in sorted_splines:
+            x0 = "x"
+            y0 = "y"
+            i = 0
+            for point in spline:
+                x = f"{point[0]:.3f}"
+                y = f"{point[1]:.3f}"
+                if x != x0 or y != y0:
+                    i = i + 1
+                    if i == 1:
+                        file.write(f"G0X{x}Y{y}S0\n")
+                    else:
+                        if i == 2:
+                            file.write(f"G1X{x}Y{y}{laserPower}\n")
+                        else:
+                            file.write(f"X{x}Y{y}\n")
+                x0 = x
+                y0 = y
+
+        file.write("M5 S0\n")
+        file.write("G0 X0 Y0 Z0 (move back to origin)\n")
+        file.write("%")
+    return True
 # ------------------------------------------
 
 # 1. Хранилище настроек (свойства)
@@ -139,7 +207,7 @@ class OBJECT_OT_GCodeExtract(bpy.types.Operator):
             return {'CANCELLED'}
 
         # Вызов твоей функции с передачей параметров
-        makeGcode(
+        result = print_sorted_bezier_splines_alternating(
             collection_name=props.target_collection.name,
             laserPower=props.laser_power,
             speedMove=props.speed_move,
@@ -147,8 +215,13 @@ class OBJECT_OT_GCodeExtract(bpy.types.Operator):
             laserMode=props.laser_mode
         )
         
-        self.report({'INFO'}, "G-Code успешно сгенерирован!")
-        return {'FINISHED'}
+        if result:
+            self.report({'INFO'}, "G-Code успешно сгенерирован!")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, "Смотри пояснения в консоли!")
+            return {'CANCELLED'}
+
 
 class VIEW3D_PT_GCodePanel(bpy.types.Panel):
     bl_label = "GCode Generator"
